@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "gpt-from-scratch"
+version = "0.1.0"
+description = ""
+authors = ["matthew-johnson <mpjohnson1414@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+torch = "^2.6.0"
+requests = "^2.32.3"
+numpy = "^2.2.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
