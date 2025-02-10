@@ -1,6 +1,6 @@
-# GPT Language Model from Scratch
+# GPT Language Model from Scratch (Tinygrad Implementation)
 
-This repository contains a PyTorch implementation of a **GPT-like language model** trained from scratch. The model is designed to generate text character by character, learning patterns from a given dataset. The code is structured to be educational, providing a clear understanding of how transformer-based models work, including self-attention mechanisms, positional embeddings, and multi-head attention.
+This repository contains a **Tinygrad implementation** of a **GPT-like language model** trained from scratch. The model is designed to generate text character by character, learning patterns from a given dataset. Tinygrad is a lightweight, minimalistic deep learning framework, making this implementation ideal for educational purposes and experimentation. The code is structured to provide a clear understanding of transformer-based models, including self-attention mechanisms, positional embeddings, and multi-head attention.
 
 ---
 
@@ -9,21 +9,21 @@ This repository contains a PyTorch implementation of a **GPT-like language model
 The project is divided into several components:
 
 1. **Text Encoding and Decoding**:
-   - A `TextEncoderDecoder` class is used to handle character-level tokenization and detokenization.
+   - A `TextEncoderDecoder` class handles character-level tokenization and detokenization.
    - The dataset is encoded into integer tensors for training.
 
 2. **Dataset Loading**:
    - The `load_dataset` function retrieves a text dataset from a URL (e.g., the Tiny Shakespeare dataset) and splits it into training and validation sets.
 
 3. **Model Architecture**:
-   - The `GPTLanguageModel` class implements a transformer-based language model with:
+   - The `GPTLanguageModel` class implements a transformer-based language model using Tinygrad, including:
      - Token and positional embeddings.
      - Multi-head self-attention.
      - Feedforward layers.
      - Layer normalization and dropout for regularization.
 
 4. **Training Loop**:
-   - The model is trained using the Adam optimizer with weight decay.
+   - The model is trained using an optimizer (e.g., SGD or Adam) implemented in Tinygrad.
    - Loss is evaluated on both training and validation sets at regular intervals.
 
 5. **Text Generation**:
@@ -39,11 +39,14 @@ The project is divided into several components:
 - **Transformer Architecture**:
   - The model uses multi-head self-attention and positional embeddings to capture long-range dependencies in the text.
 
+- **Minimalistic Framework**:
+  - Built using Tinygrad, a lightweight and easy-to-understand deep learning framework, ideal for learning and experimentation.
+
 - **Regularization**:
   - Dropout and weight decay are used to prevent overfitting.
 
 - **Educational Focus**:
-  - The code is designed to be easy to understand, with comments explaining key concepts such as attention mechanisms and layer normalization.
+  - The code is designed to be simple and easy to understand, with comments explaining key concepts such as attention mechanisms and layer normalization.
 
 ---
 
@@ -54,16 +57,16 @@ The project is divided into several components:
 - `load_dataset`: Downloads and processes the dataset, splitting it into training and validation sets.
 
 ### **2. Model Architecture**
-- `GPTLanguageModel`: The main transformer-based language model.
+- `GPTLanguageModel`: The main transformer-based language model implemented in Tinygrad.
   - Token and positional embeddings.
   - Multi-head self-attention (`MultiHeadAttention` and `Head` classes).
-  - Feedforward layers (`FeedFoward` class).
+  - Feedforward layers (`FeedForward` class).
   - Layer normalization and dropout.
 
 ### **3. Training and Evaluation**
 - `get_batch`: Generates batches of input-target pairs for training.
 - `estimate_loss`: Evaluates the model's performance on training and validation sets.
-- Training loop: Trains the model using the Adam optimizer.
+- Training loop: Trains the model using a Tinygrad optimizer.
 
 ### **4. Text Generation**
 - `generate`: Generates text by sampling from the model's predictions.
@@ -76,14 +79,13 @@ This project was created for **educational purposes** to:
 1. **Understand Transformer Architecture**:
    - Learn how self-attention, multi-head attention, and positional embeddings work in practice.
 2. **Implement a Language Model from Scratch**:
-   - Gain hands-on experience with PyTorch and neural network training.
+   - Gain hands-on experience with Tinygrad and neural network training.
 3. **Explore Text Generation**:
    - Experiment with character-level text generation and observe how the model learns patterns in the data.
 4. **Practice Debugging and Optimization**:
    - Diagnose issues like overfitting and improve model performance through techniques like dropout and weight decay.
 
 ---
-
 
 ## **Key Improvements**
 
@@ -96,6 +98,15 @@ To improve model performance:
    - Use a larger dataset to improve generalization.
 4. **Enhance Text Generation**:
    - Use beam search or temperature sampling for better text quality.
+
+---
+
+## **Why Tinygrad?**
+
+Tinygrad is a minimalistic deep learning framework that is:
+- **Lightweight**: Perfect for educational purposes and small-scale projects.
+- **Easy to Understand**: The codebase is simple and transparent, making it ideal for learning.
+- **Customizable**: You can easily modify and extend the framework to suit your needs.
 
 ---
 
@@ -118,7 +129,8 @@ This project is open-source and available under the MIT License.
 
 - Inspired by Andrej Karpathy's [char-rnn](https://github.com/karpathy/char-rnn) and [minGPT](https://github.com/karpathy/minGPT) projects.
 - Dataset from [Tiny Shakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt).
+- Built using [Tinygrad](https://github.com/tinygrad/tinygrad), a lightweight deep learning framework.
 
 ---
 
-This project is a great starting point for understanding transformer-based language models and experimenting with text generation. Happy coding! 🚀
+This project is a great starting point for understanding transformer-based language models and experimenting with text generation using Tinygrad. Happy coding! 🚀

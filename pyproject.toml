@@ -7,9 +7,10 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.12"
-torch = "^2.6.0"
+tinygrad = "^0.10.1"
 requests = "^2.32.3"
-numpy = "^2.2.0"
+numpy = "^2.2.2"
+tiktoken = "^0.8.0"
 
 [build-system]
 requires = ["poetry-core"]

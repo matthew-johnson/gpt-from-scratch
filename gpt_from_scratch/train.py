@@ -1,262 +1,182 @@
-import requests
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
+import os, math, time
+import numpy as np
+from tinygrad import Tensor, nn, fetch, Device, TinyJit, GlobalCounters
+from dataclasses import dataclass
 
-def sort_text(text):
-    return sorted(list(set(text)))
- 
-class TextEncoderDecoder:
-    def __init__(self, text):
-        self.chars = sort_text(text)
-        self.char_to_int = {char: i for i, char in enumerate(self.chars)}
-        self.int_to_char = {i: char for i, char in enumerate(self.chars)}
+@dataclass
+class GPTConfig:
+  block_size: int = 1024 
+  vocab_size: int = 50257
+  padded_vocab_size: int = 50304
+  n_layer: int = 12
+  n_head: int = 12
+  n_embd: int = 256
+  dropout: float = 0.2
 
-    def decode(self, encoded_text):
-        return ''.join(self.int_to_char[i] for i in encoded_text)
+class CausalSelfAttention:
+  def __init__(self, config:GPTConfig):
+    assert config.n_embd % config.n_head == 0
+    # key, query, value projections for all heads, but in a batch
+    self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+    # output projection
+    self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+    #dropout
+    self.dropout = config.dropout
+    # regularization
+    self.n_head = config.n_head
+    self.n_embd = config.n_embd
+    # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+    self.bias = Tensor.ones(1, 1, config.block_size, config.block_size).tril()
+    self.bias.requires_grad = False
 
-    def encode(self, text):
-        return [self.char_to_int[c] for c in text]
+  def __call__(self, x:Tensor):
+    B, T, C = x.shape
+    qkv = self.c_attn(x)
+    q, k, v = qkv.split(self.n_embd, dim=2)
+    k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-#retrieve and encode training dataset
-def load_dataset(url):
-    try:
-        response = requests.get(url) 
-    except requests.exceptions.RequestException as e:
-        print("Error occurred while fetching the dataset:", e)
-    text = response.content.decode('utf-8')
-    #read it
-    with open('input.txt', 'w', encoding='utf-8') as f:
-        f.write(text)
+    # manual implementation of attention
+    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+    att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+    att = att.softmax()
+    y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+    y = y.transpose(1, 2).view(B, T, C) # re-assemble all head outputs side by side
+    # output projection
+    y = Tensor.dropout(self.c_proj(y), self.dropout)
+    return y
 
-    #all unique charts that appear in the text
-    tED = TextEncoderDecoder(text) 
-    vocab_size = len(tED.chars)
+class MLP:
+  def __init__(self, config:GPTConfig):
+    self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+    self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
-    #encode the entire text dataset using our encoding function
-    data = torch.tensor(tED.encode(text), dtype=torch.long)
+  def __call__(self, x:Tensor) -> Tensor:
+    return self.c_proj(self.c_fc(x).gelu())
 
-    #split the data into training and validation sets
-    n = int(len(data)*0.9)
-    train_data = data[:n]
-    val_data = data[n:]
-    data = {'train':train_data, 'val':val_data}
+class Block:
+  def __init__(self, config:GPTConfig):
+    self.ln_1 = nn.LayerNorm(config.n_embd)
+    self.attn = CausalSelfAttention(config)
+    self.ln_2 = nn.LayerNorm(config.n_embd)
+    self.mlp = MLP(config)
 
-    return data, vocab_size, tED
+  def __call__(self, x:Tensor):
+    x = x + self.attn(self.ln_1(x))
+    x = x + self.mlp(self.ln_2(x))
+    return x
 
-#get the batches from input data to be used to train the model
-def get_batch(split, input_data, device, batch_size = 128, block_size = 256, seed=1337):
-    torch.manual_seed(seed)
-    data = input_data[split]
-    if split == 'train':
-        data = input_data['train']
+class GPT:
+  def __init__(self, config:GPTConfig):
+    self.config = config
+
+    self.wte = nn.Embedding(config.padded_vocab_size, config.n_embd)
+    self.wpe = nn.Embedding(config.block_size, config.n_embd)
+    self.h = [Block(config) for _ in range(config.n_layer)]
+    self.ln_f = nn.LayerNorm(config.n_embd)
+    self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
+    self.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+  def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    for _ in range(max_new_tokens):
+      idx_cond = idx if idx.shape[1] <= self.config.block_size else idx[:, -self.config.block_size:]
+      logits, _ = self(idx_cond)
+      logits = logits[:, -1, :] / temperature
+      idx_next = logits.softmax().multinomial()
+      idx = Tensor.cat(idx, idx_next, dim=1)
+    return idx
+
+  def __call__(self, idx:Tensor, targets=None):
+    b, t = idx.shape
+    pos = Tensor.arange(0, t)
+
+    tok_emb = self.wte(idx) # token embeddings of shape (b, t, n_embd)
+    pos_emb = self.wpe(pos) # position embeddings of shape (t, n_embd)
+    x = tok_emb + pos_emb
+
+    x = self.ln_f(x.sequential(self.h))
+
+    if targets is not None:
+      logits = self.lm_head(x)[:, :, :self.config.vocab_size]
+      loss = logits.sparse_categorical_crossentropy(targets)
     else:
-        data = input_data['val']
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix]).to(device)
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix]).to(device)
-    return x, y
+      logits = self.lm_head(x[:, [-1], :])[:, :, :self.config.vocab_size]
+      loss = None
 
-@torch.no_grad()
-def estimate_loss(input_data, device):
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split,input_data,device)
-            logits, loss = model(X, targets=Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+    return logits, loss
 
-class GPTLanguageModel(nn.Module):
+if __name__ == "__main__":
+  import tiktoken, argparse
 
-    def __init__(self, vocab_size, block_size, n_embed, num_heads, num_layers, device='cuda', dropout=0.3):
-        super().__init__()
-        #each token reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
-        #adding embedding of positions as an additional input
-        self.positional_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.ModuleList([Block(n_embed=n_embed, num_heads=num_heads, dropout=dropout, block_size=block_size) for _ in range(num_layers)])
-        self.ln_f = nn.LayerNorm(n_embed)
-        self.lm_head = nn.Linear(n_embed, vocab_size)
-        self.block_size = block_size
-        self.device = device
-        self.apply(self._init_weights)
-        print(f"Model initialized with vocab_size={vocab_size}, block_size={block_size}, n_embed={n_embed}, num_heads={num_heads}, num_layers={num_layers}, dropout={dropout}")
-    
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+  parser.add_argument("--batch_size", type=int, default=4, help="batch size")
+  parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+  parser.add_argument("--skip_test", action="store_true", help="skip test")
+  args = parser.parse_args()
+  B, T = args.batch_size, args.sequence_length
+  assert 1 <= T <= 1024
 
-    def forward(self, x, targets=None):
-        """
-        x: main input sequence (B, T)
-        context: additional input sequence (B, T_context)
-        targets: target sequence (B, T)
-        """
-        B, T = x.shape
-        pos_emb = self.positional_embedding_table(torch.arange(T, device=self.device)) #T,C
-        tok_emb = self.token_embedding_table(x) #B, T, C
-        x_emb = tok_emb + pos_emb #B, T, C
-        
-        for block in self.blocks:
-            x_emb = block(x_emb) #B, T, C
+  model = GPT(GPTConfig(n_layer=12, n_head=12, n_embd=768))
+  #model.load_pretrained()
 
-        x_emb = self.ln_f(x_emb) #B, T, C
-        logits = self.lm_head(x_emb) #B, T, vocab_size
-        
-        if targets is None:
-            loss = None
-        else:
-            #reshape the logits and targets to be (batch_size * time_steps, vocab_size) or (B*T, C) for use in pytorch.nn.functional.cross_entropy
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+  # init the tokenizer
+  enc = tiktoken.get_encoding("gpt2")
+  encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+  decode = lambda l: enc.decode(l)
 
-        return logits, loss
-    
-    def generate(self, x, max_new_tokens):
-        #x is of shape (batch_size, time_steps)
-        for _ in range(max_new_tokens):
-            #crop input x to the last block_size tokens
-            x_cond = x[:, -self.block_size:]
-            
-            #get the predictions
-            logits, loss = self.forward(x_cond)
-            
-            #focus only on the last time step
-            logits = logits[:, -1, :] #becomes (batch_size, vocab_size) (B,C)
-            
-            #apply softmax to get the probabilities
-            probs = F.softmax(logits, dim=-1) # (batch_size, vocab_size) (B,C)
-            
-            #sample 1 from the probabilities
-            idx_next = torch.multinomial(probs, num_samples=1) # (batch_size, 1) (B,1)
-            
-            #append sampled index to the running sequence
-            x = torch.cat((x, idx_next), dim=1)
-        return x
+  # load the tokens
+  # prefer to use tiny_shakespeare if it's available, otherwise use tiny_stories
+  # we're using val instead of train split just because it is smaller/faster
+  tokens_bin = fetch("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt")
+  assert os.path.isfile(tokens_bin)
+  print(f"loading cached tokens in {tokens_bin}")
+  with open(tokens_bin, "rb") as f:
+    f.seek(0x400)
+    tokens = np.frombuffer(f.read(), dtype=np.uint16).astype(np.int32)
+  tokens = Tensor(tokens)
 
-class FeedFoward(nn.Module):
+  # lightweight dataloader
+  def get_batch():
+    assert B*T+1 <= len(tokens), "not enough tokens"
+    # for 338,025 tokens. E.g. with B=8 T=1024, this will yield 41 batches before looping
+    i = 0
+    while True:
+      x = tokens[i:i+B*T].view(B, T)
+      y = tokens[i+1:i+B*T+1].view(B, T)
+      yield x, y
+      i += B*T
+      if i + B*T + 1 >= len(tokens):
+        i = 0 # in prod we'd want to randomize the start point a bit
 
-    def __init__(self, n_embd, dropout):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
+  # forward backward for a few iterations
+  data_iter = iter(get_batch())
+  x, y = next(data_iter) # we'll overfit this batch below
+  optimizer = nn.optim.Adam(nn.state.get_parameters(model), lr=3e-4)
 
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    #a single block of the transformer
-    def __init__(self, num_heads, block_size, n_embed, dropout):
-        super().__init__()
-        head_size = n_embed // num_heads
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.attn = MultiHeadAttention(head_size=head_size, num_heads=num_heads, block_size=block_size, n_embed=n_embed, dropout=dropout)
-        self.ln2 = nn.LayerNorm(n_embed)
-        self.ffwd = FeedFoward(n_embed, dropout)
-    
-    def forward(self, x):
-        #self attention
-        x = x + self.attn(self.ln1(x))
-        #feed forward
-        x = x + self.ffwd(self.ln2(x))
-        return x
-
-#Attention is a communication mechanism between vector spaces that can improve model performance. 
-#It allows each head to attend to a subset of the input tokens, which helps in capturing different aspects of the input data.
-#This is a scaled dot product self-attention example ("self" because value, key, and query are all produced by the same input)
-class MultiHeadAttention(nn.Module):
-    #multiple heads of self-attention in parallel
-    def __init__(self, head_size, block_size, n_embed, num_heads, dropout):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size, block_size, n_embed, dropout) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size*num_heads, n_embed)
-        self.dropout = nn.Dropout(dropout)
-        #dropout is a regularization technique used to prevent overfitting. It randomly sets some of the weights to zero during training.
-        #this is meant to improve generalization of the model
-
-    def forward(self, x):
-        out = torch.cat([head(x) for head in self.heads], dim=-1)
-        #concatenate the outputs of all heads along the last dimension (C) to form the final output
-        out = self.dropout(self.proj(out))
-        #apply dropout to the output of the projection layer
-        return out
-        
-class Head(nn.Module):
-    def __init__(self, head_size, block_size, n_embed, dropout):
-        super().__init__()
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size,block_size)))
-        self.head_size = head_size
-        self.block_size = block_size
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x):
-        B,T,C = x.shape
-        # Ensure T does not exceed block_size
-        T = min(T, self.block_size)
-        k = self.key(x) # (B,T,C)
-        q = self.query(x) # (B,T,C)
-        #compute attention scores "affinities"
-        wei = q @ k.transpose(-2,-1) * (self.head_size ** -0.5) # (B,T,C) @ (B,T,C) -> (B,T,T)
-        #normalizing by dividing by sqrt(head_size) in order to avoid softmax instability in scaling
-        
-        wei = wei.masked_fill(self.tril[:T,:T] == 0, float('-inf')) # (B,T,T) 
-        wei = F.softmax(wei, dim=-1) # (B,T,T) 
-        
-        #apply attention weights to values, weighted aggregation
-        v = self.value(x) # (B,T,hs)
-        out = wei @ v # (B,T,C) @ (B,T,C) -> (B,T,C)
-        return out
-
-torch.manual_seed(1337)
-data, vocab_size, encoder_decoder = load_dataset("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt")
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-max_iters = 5000
-eval_interval = 500
-eval_iters = 200
-learning_rate = 3e-4
-num_heads = 6
-num_layers = 6
-
-model = GPTLanguageModel(vocab_size, block_size=256, n_embed=256, device=device, num_heads=num_heads, num_layers=num_layers)
-model = model.to(device)
-
-#create pytorch Adam opitimizer and assign learning rate
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-
-for iter in range(max_iters):
-
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0 or iter == max_iters -1:
-        losses = estimate_loss(data, device)
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-    # sample a batch of data
-    xb, yb = get_batch('train', data, device)
-    
-    # evaluate the loss
-    logits, loss = model(xb, targets=yb)
-    optimizer.zero_grad(set_to_none=True)
+  @TinyJit
+  def step(x, y):
+    _, loss = model(x, y)
+    optimizer.zero_grad()
     loss.backward()
-    optimizer.step()
+    return loss.realize(*optimizer.schedule_step())
 
-#generate output for trained model
-idx = torch.zeros((1, 1), dtype=torch.long, device=device) # (B,C) (1,1) assigned zeros
-print(encoder_decoder.decode(model.generate(idx, max_new_tokens=500)[0].tolist()))
+  with Tensor.train():
+    for i in range(args.num_iterations):
+      GlobalCounters.reset()
+      t0 = time.time()
+      loss = step(x.contiguous(), y.contiguous())
+      Device[Device.DEFAULT].synchronize()
+      t1 = time.time()
+      print(f"iteration {i}, loss: {loss.item():.6f}, time: {(t1-t0)*1000:.3f}ms, {int(B*T/(t1-t0))} tok/s")
+
+  if not args.skip_test:
+    start = "<|endoftext|>"
+    start_ids = encode(start)
+    x = (Tensor(start_ids)[None, ...])
+    max_new_tokens = 16
+    temperature = 1.0
+    top_k = 40
+    y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+    print(decode(y[0].tolist()))
