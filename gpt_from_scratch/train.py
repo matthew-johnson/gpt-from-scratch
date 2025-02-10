@@ -10,7 +10,7 @@ class GPTConfig:
   padded_vocab_size: int = 50304
   n_layer: int = 12
   n_head: int = 12
-  n_embd: int = 256
+  n_embd: int = 768
   dropout: float = 0.2
 
 class CausalSelfAttention:
@@ -41,10 +41,12 @@ class CausalSelfAttention:
     att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
     att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
     att = att.softmax()
+    att = att.dropout(self.dropout)
     y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
     y = y.transpose(1, 2).view(B, T, C) # re-assemble all head outputs side by side
     # output projection
-    y = Tensor.dropout(self.c_proj(y), self.dropout)
+    y = self.c_proj(y)
+    y = y.dropout(self.dropout)
     return y
 
 class MLP:
@@ -163,20 +165,28 @@ if __name__ == "__main__":
     return loss.realize(*optimizer.schedule_step())
 
   with Tensor.train():
+    total_time = 0
     for i in range(args.num_iterations):
       GlobalCounters.reset()
       t0 = time.time()
       loss = step(x.contiguous(), y.contiguous())
       Device[Device.DEFAULT].synchronize()
       t1 = time.time()
+      total_time+=t1-t0
       print(f"iteration {i}, loss: {loss.item():.6f}, time: {(t1-t0)*1000:.3f}ms, {int(B*T/(t1-t0))} tok/s")
+    print(f"{args.num_iterations} total iterations, total time: {round(total_time,2)}s")
 
   if not args.skip_test:
     start = "<|endoftext|>"
     start_ids = encode(start)
     x = (Tensor(start_ids)[None, ...])
-    max_new_tokens = 16
+    max_new_tokens = 100
     temperature = 1.0
     top_k = 40
-    y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-    print(decode(y[0].tolist()))
+    num_samples = 2 
+    for k in range(num_samples):
+      y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+      print(decode(y[0].tolist()))
+      print('---------------') 
+    #y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+    #print(decode(y[0].tolist()))
